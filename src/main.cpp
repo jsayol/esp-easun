@@ -17,6 +17,7 @@ the transmitter.
 
 // ESP32 filesystem
 #include "SPIFFS.h"
+#include "esp_spiffs.h"
 
 // Wifi connection
 #include <DNSServer.h>
@@ -88,7 +89,7 @@ String password;
 bool captivePortalMode = false;
 
 /********* LED blinking *********/
-int ledBlinkState = HIGH;             // LED off by default
+int ledBlinkState = LOW;
 unsigned long ledPreviousMillis = 0;  // will store last time LED was updated
 
 #define CAPTIVE_DELAYS 4
@@ -279,10 +280,26 @@ void send404(AsyncWebServerRequest *request) {
     request->send(response);
 }
 
+bool ensureFilesystemMounted() {
+    if (!esp_spiffs_mounted(NULL)) {
+        if (!SPIFFS.begin(true)) {
+            OUTPUT_SERIAL_println("An Error has occurred while mounting SPIFFS");
+            return false;
+        }
+    }
+    return true;
+}
+
 // For debugging purposes, lists all available files in the internal file system
 void handleListInternalFiles(AsyncWebServerRequest *request) {
     AsyncResponseStream *response = request->beginResponseStream("text/html");
     response->print("<!DOCTYPE html><html><head><title>Internal files</title></head><body><ul>");
+
+    if (!ensureFilesystemMounted()) {
+        OUTPUT_SERIAL_println("An Error has occurred while mounting SPIFFS");
+        request->send(500, "text/plain", "Internal error while mounting SPIFFS file system");
+        return;
+    }
 
     File root = SPIFFS.open("/");
     File file = root.openNextFile();
@@ -296,6 +313,12 @@ void handleListInternalFiles(AsyncWebServerRequest *request) {
 }
 
 void handleCaptivePortalMain(AsyncWebServerRequest *request) {
+    if (!ensureFilesystemMounted()) {
+        OUTPUT_SERIAL_println("An Error has occurred while mounting SPIFFS");
+        request->send(500, "text/plain", "Internal error while mounting SPIFFS file system");
+        return;
+    }
+
     request->send(SPIFFS, "/index.html");
 }
 
@@ -337,7 +360,7 @@ void handleCaptivePortalConfig(AsyncWebServerRequest *request) {
     String ssid = request->getParam("ssid", true)->value();
     String password = request->getParam("password", true)->value();
 
-    OUTPUT_SERIAL_printf("Saving WiFi '%s' with password '%s'\n", ssid, password);
+    OUTPUT_SERIAL_printf("Saving WiFi '%s' with password '%s'\n", ssid.c_str(), password.c_str());
 
     preferences.putString("ssid", ssid);
     preferences.putString("password", password);
@@ -439,11 +462,13 @@ void startServer() {
     unsigned long connectionStart = millis();
 
     while (!wifiConnected && !wifiFailure && (millis() - connectionStart < wifiTimeout)) {
-        OUTPUT_SERIAL_print('.');
         wifiStatus = WiFi.status();
+        OUTPUT_SERIAL_print('.');
+        // OUTPUT_SERIAL_printf(" | %d", wifiStatus);
 
         switch (wifiStatus) {
             case WL_DISCONNECTED:
+            case WL_IDLE_STATUS:
                 // It's connecting, nothing to do but wait
                 break;
 
@@ -508,9 +533,46 @@ void startServer() {
         ESP.restart();
     });
 
+    // We also provide access to the setup page from the Captive Portal, but under /setup
+    server.on("/setup/", HTTP_GET, [](AsyncWebServerRequest *request) {
+        if (!ensureFilesystemMounted()) {
+            OUTPUT_SERIAL_println("An Error has occurred while mounting SPIFFS");
+            request->send(500, "text/plain", "Internal error while mounting SPIFFS file system");
+            return;
+        }
+
+        if (!ON_AP_FILTER(request)) {
+            request->send(SPIFFS, "/index.html");
+        }
+    });
+    server.on("/scan", HTTP_GET, handleCaptivePortalScan);
+    server.on("/config", HTTP_POST, handleCaptivePortalConfig);
     server.on("/_files", HTTP_GET, handleListInternalFiles);
 
-    server.onNotFound(send404);
+    server.onNotFound([](AsyncWebServerRequest *request) {
+        if (!ensureFilesystemMounted()) {
+            OUTPUT_SERIAL_println("An Error has occurred while mounting SPIFFS");
+            request->send(500, "text/plain", "Internal error while mounting SPIFFS file system");
+            return;
+        }
+
+        if (!ON_AP_FILTER(request) && (request->method() == HTTP_GET)) {
+            String url(request->url() + "");
+
+            if (url == "/setup") {
+                request->redirect("/setup/");
+                return;
+            }
+
+            url.replace("/setup/", "/");
+
+            if (SPIFFS.exists(url)) {
+                request->send(SPIFFS, url);
+                return;
+            }
+        }
+        send404(request);
+    });
 
     server.begin();
 }
@@ -525,7 +587,7 @@ void setup() {
 #endif
 
     // Initialize preferences store
-    preferences.begin("credentials", false);
+    preferences.begin("credentials", /*readonly=*/false);
 
 #ifdef CLEAR_PREFS
     preferences.clear();
@@ -534,7 +596,7 @@ void setup() {
     ssid = preferences.getString("ssid", "");
     password = preferences.getString("password", "");
 
-    OUTPUT_SERIAL_printf("\n\nSSID=\"%s\" PASSWORD=\"%s\"\n", ssid, password);
+    OUTPUT_SERIAL_printf("\n\nSSID=\"%s\" PASSWORD=\"%s\"\n", ssid.c_str(), password.c_str());
 
     if ((ssid == "") || (password == "")) {
         startCaptivePortalServer();

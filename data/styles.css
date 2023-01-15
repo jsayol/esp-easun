@@ -66,6 +66,11 @@ body {
   background-color: #fff;
 }
 
+.wrapper form .row select,
+.wrapper form .row select option {
+  font-family: monospace;
+}
+
 form .row input:focus,
 form .row select:focus {
   border-color: #16a085;
