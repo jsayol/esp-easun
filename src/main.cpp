@@ -37,9 +37,6 @@ the transmitter.
 // Store/retrieve preferences (network credentials)
 #include <Preferences.h>
 
-// Comment this to disable output to serial
-#define OUTPUT_SERIAL Serial
-
 #define MODBUS_SERIAL Serial2
 #define MODBUS_DEVICE_ID 1
 #define MODBUS_TIMEOUT 2000
@@ -52,6 +49,9 @@ the transmitter.
 #define HTTP_PARAM_ADDRESS "a"
 #define HTTP_PARAM_LENGTH "l"
 
+// Comment this to disable output to serial
+#define OUTPUT_SERIAL Serial
+
 #ifdef OUTPUT_SERIAL
 #define OUTPUT_SERIAL_print(...) OUTPUT_SERIAL.print(__VA_ARGS__)
 #define OUTPUT_SERIAL_printf(...) OUTPUT_SERIAL.printf(__VA_ARGS__)
@@ -62,9 +62,12 @@ the transmitter.
 #define OUTPUT_SERIAL_println(...)
 #endif
 
+// Uncomment this to clear all stored preferences when booting
+// #define CLEAR_PREFS
+
 // Create a ModbusRTU client instance
-ModbusClientRTU modbus(MODBUS_SERIAL, MODBUS_DERE_PIN);
-// ModbusClientRTU modbus(MODBUS_SERIAL);
+// ModbusClientRTU modbus(MODBUS_SERIAL, MODBUS_DERE_PIN);
+ModbusClientRTU modbus(MODBUS_SERIAL);
 
 DNSServer dnsServer;
 AsyncWebServer server(80);
@@ -85,18 +88,24 @@ String password;
 bool captivePortalMode = false;
 
 /********* LED blinking *********/
-int ledBlinkState = LOW;           // LED off by default
-unsigned long previousMillis = 0;  // will store last time LED was updated
+int ledBlinkState = HIGH;             // LED off by default
+unsigned long ledPreviousMillis = 0;  // will store last time LED was updated
 
 #define CAPTIVE_DELAYS 4
 long ledCaptiveDelays[CAPTIVE_DELAYS] = {150, 150, 150, 1000};
 int ledBlinkDelayNum = 0;
 
-long ledConnectingInterval = 1000;
+long ledConnectingInterval = 500;  // ms
 /********* LED blinking *********/
+
+unsigned long wifiPreviousMillis = 0;  // will store last time WiFi was checked
+long wifiCheckInterval = 5000;         // ms
+bool wifiConnected = false;
+long wifiTimeout = 10000;  // ms to wait while connecting before we consider the password is incorrect
 
 // API endpoint to get the values of holding registers
 void handleHTTPGet(AsyncWebServerRequest *request) {
+    OUTPUT_SERIAL_printf("[%u] GET request: %s\n", millis(), request->url());
     uint8_t address;
     uint8_t length;
 
@@ -113,6 +122,7 @@ void handleHTTPGet(AsyncWebServerRequest *request) {
     }
 
     if ((address == 0) || (length == 0)) {
+        OUTPUT_SERIAL_printf("[%u] GET request error\n", millis());
         request->send(400, "application/json", "{\"error\": \"Invalid address or length\"}");
         return;
     }
@@ -417,16 +427,60 @@ void ledFlipState() {
 }
 
 void startServer() {
+    wl_status_t wifiStatus;
+    bool wifiFailure = false;
+    String wifiFailureMsg;
+
     // Connect to Wi-Fi
     WiFi.mode(WIFI_STA);
     WiFi.begin(ssid.c_str(), password.c_str());
 
     OUTPUT_SERIAL_print("Connecting to WiFi ..");
+    unsigned long connectionStart = millis();
 
-    while (WiFi.status() != WL_CONNECTED) {
+    while (!wifiConnected && !wifiFailure && (millis() - connectionStart < wifiTimeout)) {
         OUTPUT_SERIAL_print('.');
+        wifiStatus = WiFi.status();
+
+        switch (wifiStatus) {
+            case WL_DISCONNECTED:
+                // It's connecting, nothing to do but wait
+                break;
+
+            case WL_CONNECTED:
+                wifiConnected = true;
+                break;
+
+            case WL_NO_SSID_AVAIL:
+                wifiFailureMsg = "The specified SSID couldn't be found";
+                wifiFailure = true;
+                break;
+
+            case WL_CONNECT_FAILED:
+            case WL_CONNECTION_LOST:
+                wifiFailureMsg = "Connection failed";
+                wifiFailure = true;
+                break;
+
+            default:
+                wifiFailureMsg = "unknown";
+                wifiFailure = true;
+        }
+
         ledFlipState();
         delay(ledConnectingInterval);
+    }
+
+    if (!wifiConnected && !wifiFailure) {
+        // Connection attempt timed out
+        wifiFailureMsg = "Wrong password or some other connection issue";
+        wifiFailure = true;
+    }
+
+    if (wifiFailure) {
+        OUTPUT_SERIAL_printf("\nFailed to connect to WiFi: [%d] %s", wifiStatus, wifiFailureMsg.c_str());
+        digitalWrite(LED_BUILTIN, HIGH);
+        return;
     }
 
     // Once connected we want to leave the LED on
@@ -434,8 +488,6 @@ void startServer() {
 
     OUTPUT_SERIAL_print(" Connected! IP: ");
     OUTPUT_SERIAL_println(WiFi.localIP());
-
-    ledFlipState();  // Light the onboard LED to signal that we're connected to WiFi
 
     server.on("/disable", HTTP_GET, [](AsyncWebServerRequest *request) {
         modbus.end();
@@ -467,11 +519,17 @@ void setup() {
     pinMode(LED_BUILTIN, OUTPUT);
     digitalWrite(LED_BUILTIN, ledBlinkState);
 
+#ifdef OUTPUT_SERIAL
     // initialize the serial communication at 9600 baud rate
     OUTPUT_SERIAL.begin(9600);
+#endif
 
     // Initialize preferences store
     preferences.begin("credentials", false);
+
+#ifdef CLEAR_PREFS
+    preferences.clear();
+#endif
 
     ssid = preferences.getString("ssid", "");
     password = preferences.getString("password", "");
@@ -487,14 +545,15 @@ void setup() {
 }
 
 void loop() {
+    unsigned long currentMillis = millis();
+
     if (captivePortalMode) {
         dnsServer.processNextRequest();
 
         // Blink the onboard LED to signal we're in Captive Portal mode
-        unsigned long currentMillis = millis();
-        if (currentMillis - previousMillis >= ledCaptiveDelays[ledBlinkDelayNum]) {
+        if (currentMillis - ledPreviousMillis >= ledCaptiveDelays[ledBlinkDelayNum]) {
             // save the last time you blinked the LED
-            previousMillis = currentMillis;
+            ledPreviousMillis = currentMillis;
 
             if (ledBlinkDelayNum == (CAPTIVE_DELAYS - 1)) {
                 ledBlinkDelayNum = 0;
@@ -503,6 +562,16 @@ void loop() {
             }
 
             ledFlipState();
+        }
+    } else if (wifiConnected) {
+        if (currentMillis - wifiPreviousMillis >= wifiCheckInterval) {
+            // save the last time you blinked the LED
+            wifiPreviousMillis = currentMillis;
+
+            if (WiFi.status() != WL_CONNECTED) {
+                Serial.println("WiFi disconnected. Restarting.");
+                ESP.restart();
+            }
         }
     }
 }
