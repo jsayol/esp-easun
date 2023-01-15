@@ -84,6 +84,17 @@ String ssid;
 String password;
 bool captivePortalMode = false;
 
+/********* LED blinking *********/
+int ledBlinkState = LOW;           // LED off by default
+unsigned long previousMillis = 0;  // will store last time LED was updated
+
+#define CAPTIVE_DELAYS 4
+long ledCaptiveDelays[CAPTIVE_DELAYS] = {150, 150, 150, 1000};
+int ledBlinkDelayNum = 0;
+
+long ledConnectingInterval = 1000;
+/********* LED blinking *********/
+
 // API endpoint to get the values of holding registers
 void handleHTTPGet(AsyncWebServerRequest *request) {
     uint8_t address;
@@ -394,6 +405,17 @@ void modbusSetup() {
     modbusEnabled = true;
 }
 
+void ledFlipState() {
+    if (ledBlinkState == LOW) {
+        ledBlinkState = HIGH;
+    } else {
+        ledBlinkState = LOW;
+    }
+
+    // set the LED with the ledState of the variable:
+    digitalWrite(LED_BUILTIN, ledBlinkState);
+}
+
 void startServer() {
     // Connect to Wi-Fi
     WiFi.mode(WIFI_STA);
@@ -403,11 +425,17 @@ void startServer() {
 
     while (WiFi.status() != WL_CONNECTED) {
         OUTPUT_SERIAL_print('.');
-        delay(500);
+        ledFlipState();
+        delay(ledConnectingInterval);
     }
+
+    // Once connected we want to leave the LED on
+    digitalWrite(LED_BUILTIN, LOW);
 
     OUTPUT_SERIAL_print(" Connected! IP: ");
     OUTPUT_SERIAL_println(WiFi.localIP());
+
+    ledFlipState();  // Light the onboard LED to signal that we're connected to WiFi
 
     server.on("/disable", HTTP_GET, [](AsyncWebServerRequest *request) {
         modbus.end();
@@ -436,6 +464,9 @@ void startServer() {
 }
 
 void setup() {
+    pinMode(LED_BUILTIN, OUTPUT);
+    digitalWrite(LED_BUILTIN, ledBlinkState);
+
     // initialize the serial communication at 9600 baud rate
     OUTPUT_SERIAL.begin(9600);
 
@@ -458,5 +489,20 @@ void setup() {
 void loop() {
     if (captivePortalMode) {
         dnsServer.processNextRequest();
+
+        // Blink the onboard LED to signal we're in Captive Portal mode
+        unsigned long currentMillis = millis();
+        if (currentMillis - previousMillis >= ledCaptiveDelays[ledBlinkDelayNum]) {
+            // save the last time you blinked the LED
+            previousMillis = currentMillis;
+
+            if (ledBlinkDelayNum == (CAPTIVE_DELAYS - 1)) {
+                ledBlinkDelayNum = 0;
+            } else {
+                ledBlinkDelayNum += 1;
+            }
+
+            ledFlipState();
+        }
     }
 }
